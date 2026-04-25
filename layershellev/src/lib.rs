@@ -220,7 +220,7 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -353,6 +353,12 @@ struct LayerSurfaceState {
     keyboard_interactivity: KeyboardInteractivity,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LayerSurfaceApplyMode {
+    Full,
+    Remap,
+}
+
 impl LayerSurfaceState {
     fn new(
         layer: Layer,
@@ -373,12 +379,27 @@ impl LayerSurfaceState {
     }
 
     fn apply_to(self, layer_shell: &ZwlrLayerSurfaceV1) {
+        self.apply_to_with_mode(layer_shell, LayerSurfaceApplyMode::Full);
+    }
+
+    fn apply_to_for_remap(self, layer_shell: &ZwlrLayerSurfaceV1) {
+        self.apply_to_with_mode(layer_shell, LayerSurfaceApplyMode::Remap);
+    }
+
+    fn apply_to_with_mode(self, layer_shell: &ZwlrLayerSurfaceV1, mode: LayerSurfaceApplyMode) {
         layer_shell.set_layer(self.layer);
         layer_shell.set_anchor(self.anchor);
         layer_shell.set_keyboard_interactivity(self.keyboard_interactivity);
 
         if let Some((width, height)) = self.size {
-            layer_shell.set_size(width, height);
+            // After a layer-surface unmap, the role state resets to protocol
+            // defaults. The default size is already 0x0, so the remap
+            // bufferless commit does not need to resend it; avoiding that keeps
+            // picky compositors from validating an explicit 0x0 request before
+            // the new configure round-trip starts.
+            if !matches!(mode, LayerSurfaceApplyMode::Remap) || (width, height) != (0, 0) {
+                layer_shell.set_size(width, height);
+            }
         }
 
         if let Some(zone) = self.exclusive_zone {
@@ -388,6 +409,22 @@ impl LayerSurfaceState {
         if let Some((top, right, bottom, left)) = self.margin {
             layer_shell.set_margin(top, right, bottom, left);
         }
+    }
+
+    fn validate(self) -> Result<(), &'static str> {
+        let (width, height) = self.size.unwrap_or((0, 0));
+        let horizontal_edges = self.anchor & (Anchor::Left | Anchor::Right);
+        let vertical_edges = self.anchor & (Anchor::Top | Anchor::Bottom);
+
+        if width == 0 && horizontal_edges != (Anchor::Left | Anchor::Right) {
+            return Err("width=0 requires anchor Left|Right");
+        }
+
+        if height == 0 && vertical_edges != (Anchor::Top | Anchor::Bottom) {
+            return Err("height=0 requires anchor Top|Bottom");
+        }
+
+        Ok(())
     }
 }
 
@@ -447,6 +484,33 @@ impl Shell {
     fn reapply_state(&self) {
         if let Self::LayerShell { shell, state } = self {
             state.borrow().apply_to(shell);
+        }
+    }
+
+    fn reapply_state_for_remap(&self) {
+        if let Self::LayerShell { shell, state } = self {
+            state.borrow().apply_to_for_remap(shell);
+        }
+    }
+
+    fn layer_state(&self) -> Option<LayerSurfaceState> {
+        if let Self::LayerShell { state, .. } = self {
+            Some(*state.borrow())
+        } else {
+            None
+        }
+    }
+
+    fn update_layer_state(
+        &self,
+        update: impl FnOnce(&mut LayerSurfaceState),
+    ) -> Option<LayerSurfaceState> {
+        if let Self::LayerShell { state, .. } = self {
+            let mut state = state.borrow_mut();
+            update(&mut state);
+            Some(*state)
+        } else {
+            None
         }
     }
 
@@ -519,6 +583,8 @@ impl<T> WindowStateUnitBuilder<T> {
                 // Unknown why it is 120
                 scale: 120,
                 request_flag: Default::default(),
+                pending_role_state_commit: Cell::new(None),
+                viewport_destination_pending_restore: false,
                 present_available_state: Default::default(),
             },
         }
@@ -607,6 +673,8 @@ pub struct WindowStateUnit<T> {
 
     scale: u32,
     request_flag: WindowStateUnitRequestFlag,
+    pending_role_state_commit: Cell<Option<&'static str>>,
+    viewport_destination_pending_restore: bool,
     present_available_state: PresentAvailableState,
 }
 
@@ -658,13 +726,136 @@ impl<T> WindowStateUnit<T> {
     }
 
     fn can_commit_role_state(&self) -> bool {
-        self.map_state != WindowMapState::Unmapped
+        self.map_state == WindowMapState::Mapped
     }
 
-    fn commit_role_state_if_visible(&self) {
-        if self.can_commit_role_state() {
-            self.wl_surface.commit();
+    fn validate_layer_state_for_commit(
+        &self,
+        reason: &'static str,
+        layer_state: LayerSurfaceState,
+    ) -> bool {
+        match layer_state.validate() {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!(
+                    "[layershellev][role_state_invalid] window_id={:?} reason={} anchor={:?} size={:?} layer={:?} margin={:?} exclusive_zone={:?} error={}",
+                    self.id,
+                    reason,
+                    layer_state.anchor,
+                    layer_state.size,
+                    layer_state.layer,
+                    layer_state.margin,
+                    layer_state.exclusive_zone,
+                    error
+                );
+                false
+            }
         }
+    }
+
+    fn reapply_cached_role_state_with_mode(
+        &self,
+        reason: &'static str,
+        layer_state: LayerSurfaceState,
+        mode: LayerSurfaceApplyMode,
+    ) -> bool {
+        if !self.validate_layer_state_for_commit(reason, layer_state) {
+            return false;
+        }
+
+        let elided_default_size =
+            matches!(mode, LayerSurfaceApplyMode::Remap) && layer_state.size == Some((0, 0));
+        log::info!(
+            "[layershellev][role_state_reapply] window_id={:?} reason={} mode={:?} anchor={:?} size={:?} layer={:?} margin={:?} exclusive_zone={:?} keyboard_interactivity={:?} elided_default_size={}",
+            self.id,
+            reason,
+            mode,
+            layer_state.anchor,
+            layer_state.size,
+            layer_state.layer,
+            layer_state.margin,
+            layer_state.exclusive_zone,
+            layer_state.keyboard_interactivity,
+            elided_default_size
+        );
+
+        match mode {
+            LayerSurfaceApplyMode::Full => self.shell.reapply_state(),
+            LayerSurfaceApplyMode::Remap => self.shell.reapply_state_for_remap(),
+        }
+
+        true
+    }
+
+    fn reapply_cached_role_state(
+        &self,
+        reason: &'static str,
+        layer_state: LayerSurfaceState,
+    ) -> bool {
+        self.reapply_cached_role_state_with_mode(reason, layer_state, LayerSurfaceApplyMode::Full)
+    }
+
+    fn reapply_cached_role_state_for_remap(
+        &self,
+        reason: &'static str,
+        layer_state: LayerSurfaceState,
+    ) -> bool {
+        self.reapply_cached_role_state_with_mode(reason, layer_state, LayerSurfaceApplyMode::Remap)
+    }
+
+    fn unset_viewport_destination_for_bufferless_commit(&self, reason: &'static str) -> bool {
+        let Some(viewport) = &self.viewport else {
+            return false;
+        };
+
+        log::info!(
+            "[layershellev][viewport_destination_unset] window_id={:?} reason={}",
+            self.id,
+            reason
+        );
+        viewport.set_destination(-1, -1);
+        true
+    }
+
+    fn set_viewport_destination_to_configured_size(&self, reason: &'static str) -> bool {
+        let Some(viewport) = &self.viewport else {
+            return false;
+        };
+
+        let (width, height) = self.size;
+        if width == 0 || height == 0 {
+            log::info!(
+                "[layershellev][viewport_destination_skip] window_id={:?} reason={} size={}x{}",
+                self.id,
+                reason,
+                width,
+                height
+            );
+            return false;
+        }
+
+        log::info!(
+            "[layershellev][viewport_destination_set] window_id={:?} reason={} size={}x{}",
+            self.id,
+            reason,
+            width,
+            height
+        );
+        viewport.set_destination(width as i32, height as i32);
+        true
+    }
+
+    fn commit_cached_role_state_if_visible(
+        &self,
+        reason: &'static str,
+        layer_state: LayerSurfaceState,
+    ) {
+        if !self.can_commit_role_state() {
+            return;
+        }
+
+        let _ = layer_state;
+        self.pending_role_state_commit.set(Some(reason));
     }
 
     fn handle_configure(&mut self) {
@@ -680,7 +871,29 @@ impl<T> WindowStateUnit<T> {
             return;
         }
 
+        let was_waiting_configure = self.map_state == WindowMapState::WaitingConfigure;
         self.map_state = WindowMapState::Mapped;
+        if let Some(layer_state) = self.shell.layer_state() {
+            let valid = if was_waiting_configure {
+                self.reapply_cached_role_state_for_remap("configure_ready", layer_state)
+            } else {
+                self.reapply_cached_role_state("configure_ready", layer_state)
+            };
+
+            if !valid {
+                self.request_flag.refresh = RefreshRequest::Wait;
+                return;
+            }
+        }
+
+        if self.viewport_destination_pending_restore
+            && self.set_viewport_destination_to_configured_size("configure_ready")
+        {
+            // The viewport destination was unset for a null-buffer commit. Once
+            // configure gives us a valid size, restoring it lets iced reuse the
+            // same surface without recreating GPU objects.
+            self.viewport_destination_pending_restore = false;
+        }
         self.request_refresh(RefreshRequest::NextFrame);
     }
 
@@ -689,14 +902,30 @@ impl<T> WindowStateUnit<T> {
             return;
         }
 
-        log::info!("[layershellev][map] window_id={:?}", self.id);
+        let layer_state = self.shell.layer_state();
+        if let Some(layer_state) = layer_state
+            && !self.reapply_cached_role_state_for_remap("map_bufferless_commit", layer_state)
+        {
+            return;
+        }
+
+        let log_anchor = layer_state.map(|state| state.anchor);
+        let log_size = layer_state.and_then(|state| state.size);
+        log::info!(
+            "[layershellev][map] window_id={:?} anchor={:?} size={:?}",
+            self.id,
+            log_anchor,
+            log_size
+        );
+        self.pending_role_state_commit.take();
         self.request_flag.refresh = RefreshRequest::Wait;
         self.present_available_state = PresentAvailableState::Available;
         self.map_state = WindowMapState::WaitingConfigure;
 
         // The layer/xdg protocols require a bufferless commit before the
         // compositor is allowed to configure the remapped surface.
-        self.shell.reapply_state();
+        self.viewport_destination_pending_restore |=
+            self.unset_viewport_destination_for_bufferless_commit("bufferless_remap_commit");
         log::info!(
             "[layershellev][attach_null_buffer] window_id={:?} reason=bufferless_remap_commit",
             self.id
@@ -710,11 +939,14 @@ impl<T> WindowStateUnit<T> {
         }
 
         log::info!("[layershellev][unmap] window_id={:?}", self.id);
+        self.pending_role_state_commit.take();
         self.request_flag.refresh = RefreshRequest::Wait;
         self.present_available_state = PresentAvailableState::Available;
 
         // Attaching a null buffer unmaps the surface without destroying its
         // role object or wl_surface. This is what separates hide from close.
+        self.viewport_destination_pending_restore |=
+            self.unset_viewport_destination_for_bufferless_commit("hide_unmap");
         log::info!(
             "[layershellev][attach_null_buffer] window_id={:?} reason=hide_unmap",
             self.id
@@ -800,98 +1032,65 @@ impl<T> WindowStateUnit<T> {
 
     /// set the anchor of the current unit. please take the simple.rs as reference
     pub fn set_anchor(&self, anchor: Anchor) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
-        {
-            state.borrow_mut().anchor = anchor;
-            layer_shell.set_anchor(anchor);
-            self.commit_role_state_if_visible();
+        if let Some(layer_state) = self.shell.update_layer_state(|state| state.anchor = anchor) {
+            self.commit_cached_role_state_if_visible("set_anchor", layer_state);
         }
     }
 
     /// you can reset the margin which bind to the surface
     pub fn set_margin(&self, (top, right, bottom, left): (i32, i32, i32, i32)) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
+        if let Some(layer_state) = self
+            .shell
+            .update_layer_state(|state| state.margin = Some((top, right, bottom, left)))
         {
-            state.borrow_mut().margin = Some((top, right, bottom, left));
-            layer_shell.set_margin(top, right, bottom, left);
-            self.commit_role_state_if_visible();
+            self.commit_cached_role_state_if_visible("set_margin", layer_state);
         }
     }
 
     /// set the layer
     pub fn set_layer(&self, layer: Layer) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
-        {
-            state.borrow_mut().layer = layer;
-            layer_shell.set_layer(layer);
-            self.commit_role_state_if_visible();
+        if let Some(layer_state) = self.shell.update_layer_state(|state| state.layer = layer) {
+            self.commit_cached_role_state_if_visible("set_layer", layer_state);
         }
     }
 
     /// set the anchor and set the size together
     /// When you want to change layer from LEFT|RIGHT|BOTTOM to TOP|LEFT|BOTTOM, use it
     pub fn set_anchor_with_size(&self, anchor: Anchor, (width, height): (u32, u32)) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
-        {
-            let mut state = state.borrow_mut();
+        if let Some(layer_state) = self.shell.update_layer_state(|state| {
             state.anchor = anchor;
             state.size = Some((width, height));
-            drop(state);
-
-            layer_shell.set_anchor(anchor);
-            layer_shell.set_size(width, height);
-            self.commit_role_state_if_visible();
+        }) {
+            self.commit_cached_role_state_if_visible("set_anchor_with_size", layer_state);
         }
     }
 
     /// set the layer size of current unit
     pub fn set_size(&self, (width, height): (u32, u32)) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
+        if let Some(layer_state) = self
+            .shell
+            .update_layer_state(|state| state.size = Some((width, height)))
         {
-            state.borrow_mut().size = Some((width, height));
-            layer_shell.set_size(width, height);
-            self.commit_role_state_if_visible();
+            self.commit_cached_role_state_if_visible("set_size", layer_state);
         }
     }
 
     /// set current exclusive_zone
     pub fn set_exclusive_zone(&self, zone: i32) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
+        if let Some(layer_state) = self
+            .shell
+            .update_layer_state(|state| state.exclusive_zone = Some(zone))
         {
-            state.borrow_mut().exclusive_zone = Some(zone);
-            layer_shell.set_exclusive_zone(zone);
-            self.commit_role_state_if_visible();
+            self.commit_cached_role_state_if_visible("set_exclusive_zone", layer_state);
         }
     }
 
     /// set keyboard interactivity
     pub fn set_keyboard_interactivity(&self, keyboard_interactivity: KeyboardInteractivity) {
-        if let Shell::LayerShell {
-            shell: layer_shell,
-            state,
-        } = &self.shell
-        {
-            state.borrow_mut().keyboard_interactivity = keyboard_interactivity;
-            layer_shell.set_keyboard_interactivity(keyboard_interactivity);
-            self.commit_role_state_if_visible();
+        if let Some(layer_state) = self.shell.update_layer_state(|state| {
+            state.keyboard_interactivity = keyboard_interactivity;
+        }) {
+            self.commit_cached_role_state_if_visible("set_keyboard_interactivity", layer_state);
         }
     }
 
@@ -3242,6 +3441,24 @@ impl<T: 'static> WindowState<T> {
                 .collect();
             for (id, visible) in visibility_requests {
                 window_state.apply_visibility_request(id, visible);
+            }
+
+            for unit in &window_state.units {
+                let Some(reason) = unit.pending_role_state_commit.take() else {
+                    continue;
+                };
+                if !unit.is_mapped() {
+                    continue;
+                }
+                let Some(layer_state) = unit.shell.layer_state() else {
+                    continue;
+                };
+                if unit.reapply_cached_role_state(reason, layer_state) {
+                    // Layer-shell state is double-buffered on wl_surface.commit.
+                    // Flush all coalesced setter changes as one atomic snapshot
+                    // after visibility changes have been applied for this loop.
+                    unit.wl_surface.commit();
+                }
             }
 
             let closed_ids = window_state.closed_ids.clone();
