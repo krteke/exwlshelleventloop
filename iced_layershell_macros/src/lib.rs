@@ -55,6 +55,8 @@ pub fn to_layer_message(attr: TokenStream2, input: TokenStream2) -> manyhow::Res
                 NewMenu { settings: iced_layershell::actions::IcedNewMenuSettings, id: iced_layershell::reexport::IcedId },
                 NewInputPanel { settings: iced_layershell::reexport::NewInputPanelSettings, id: iced_layershell::reexport::IcedId },
                 RemoveWindow(iced_layershell::reexport::IcedId),
+                UnmapWindow(iced_layershell::reexport::IcedId),
+                MapWindow(iced_layershell::reexport::IcedId),
                 ForgetLastOutput,
             };
 
@@ -119,6 +121,8 @@ pub fn to_layer_message(attr: TokenStream2, input: TokenStream2) -> manyhow::Res
                             Self::NewMenu { settings, id } =>  Ok(LayerShellCustomActionWithId::new(None, LayerShellCustomAction::NewMenu {settings, id })),
                             Self::NewInputPanel {settings, id } => Ok(LayerShellCustomActionWithId::new(None, LayerShellCustomAction::NewInputPanel { settings, id })),
                             Self::RemoveWindow(id) => Ok(LayerShellCustomActionWithId::new(Some(id), LayerShellCustomAction::RemoveWindow)),
+                            Self::UnmapWindow(id) => Ok(LayerShellCustomActionWithId::new(Some(id), LayerShellCustomAction::UnmapWindow)),
+                            Self::MapWindow(id) => Ok(LayerShellCustomActionWithId::new(Some(id), LayerShellCustomAction::MapWindow)),
                             Self::ForgetLastOutput => Ok(LayerShellCustomActionWithId::new(None, LayerShellCustomAction::ForgetLastOutput)),
                             _ => Err(self)
                         }
@@ -142,6 +146,8 @@ pub fn to_layer_message(attr: TokenStream2, input: TokenStream2) -> manyhow::Res
                 VirtualKeyboardPressed {
                     key: u32,
                 },
+                UnmapWindow,
+                MapWindow,
             };
             let impl_quote = quote! {
                 impl #impl_gen TryInto<iced_layershell::actions::LayerShellCustomActionWithId> for #ident #ty_gen #where_gen {
@@ -164,6 +170,8 @@ pub fn to_layer_message(attr: TokenStream2, input: TokenStream2) -> manyhow::Res
                             Self::VirtualKeyboardPressed { key } => Ok(LayerShellCustomActionWithId::new(None, LayerShellCustomAction::VirtualKeyboardPressed {
                                 key
                             })),
+                            Self::UnmapWindow => Ok(LayerShellCustomActionWithId::new(None, LayerShellCustomAction::UnmapWindow)),
+                            Self::MapWindow => Ok(LayerShellCustomActionWithId::new(None, LayerShellCustomAction::MapWindow)),
                             _ => Err(self)
                         }
                     }

@@ -220,6 +220,7 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -333,16 +334,67 @@ impl ZxdgOutputInfo {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 enum Shell {
-    LayerShell(ZwlrLayerSurfaceV1),
+    LayerShell {
+        shell: ZwlrLayerSurfaceV1,
+        state: RefCell<LayerSurfaceState>,
+    },
     PopUp((XdgPopup, XdgSurface)),
     XdgTopLevel((XdgToplevel, XdgSurface, Option<ZxdgToplevelDecorationV1>)),
     InputPanel(#[allow(unused)] ZwpInputPanelSurfaceV1),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LayerSurfaceState {
+    layer: Layer,
+    anchor: Anchor,
+    exclusive_zone: Option<i32>,
+    margin: Option<(i32, i32, i32, i32)>,
+    size: Option<(u32, u32)>,
+    keyboard_interactivity: KeyboardInteractivity,
+}
+
+impl LayerSurfaceState {
+    fn new(
+        layer: Layer,
+        anchor: Anchor,
+        keyboard_interactivity: KeyboardInteractivity,
+        size: Option<(u32, u32)>,
+        exclusive_zone: Option<i32>,
+        margin: Option<(i32, i32, i32, i32)>,
+    ) -> Self {
+        Self {
+            layer,
+            anchor,
+            exclusive_zone,
+            margin,
+            size,
+            keyboard_interactivity,
+        }
+    }
+
+    fn apply_to(self, layer_shell: &ZwlrLayerSurfaceV1) {
+        layer_shell.set_layer(self.layer);
+        layer_shell.set_anchor(self.anchor);
+        layer_shell.set_keyboard_interactivity(self.keyboard_interactivity);
+
+        if let Some((width, height)) = self.size {
+            layer_shell.set_size(width, height);
+        }
+
+        if let Some(zone) = self.exclusive_zone {
+            layer_shell.set_exclusive_zone(zone);
+        }
+
+        if let Some((top, right, bottom, left)) = self.margin {
+            layer_shell.set_margin(top, right, bottom, left);
+        }
+    }
+}
+
 impl PartialEq<ZwlrLayerSurfaceV1> for Shell {
     fn eq(&self, other: &ZwlrLayerSurfaceV1) -> bool {
         match self {
-            Self::LayerShell(shell) => shell == other,
+            Self::LayerShell { shell, .. } => shell == other,
             _ => false,
         }
     }
@@ -387,8 +439,14 @@ impl Shell {
                 top_level.destroy();
                 xdg_surface.destroy();
             }
-            Self::LayerShell(shell) => shell.destroy(),
+            Self::LayerShell { shell, .. } => shell.destroy(),
             Self::InputPanel(_) => {}
+        }
+    }
+
+    fn reapply_state(&self) {
+        if let Self::LayerShell { shell, state } = self {
+            state.borrow().apply_to(shell);
         }
     }
 
@@ -415,6 +473,19 @@ enum PresentAvailableState {
     Available,
     /// Availability is taken.
     Taken,
+}
+
+/// Mapping state of the Wayland surface.
+///
+/// `Unmapped` means the surface has been hidden with a null-buffer commit.
+/// `WaitingConfigure` is the protocol-mandated remap phase after a bufferless
+/// commit; drawing is only legal once the compositor sends configure.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowMapState {
+    Unmapped,
+    #[default]
+    WaitingConfigure,
+    Mapped,
 }
 
 struct WindowStateUnitBuilder<T> {
@@ -444,6 +515,7 @@ impl<T> WindowStateUnitBuilder<T> {
                 wl_output: Default::default(),
                 binding: Default::default(),
                 becreated: Default::default(),
+                map_state: Default::default(),
                 // Unknown why it is 120
                 scale: 120,
                 request_flag: Default::default(),
@@ -511,6 +583,8 @@ struct WindowStateUnitRequestFlag {
     close: bool,
     /// The flag of if this window has been requested to be refreshed.
     refresh: RefreshRequest,
+    /// The flag of if this window is mapped.
+    visibility: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -528,6 +602,8 @@ pub struct WindowStateUnit<T> {
     wl_output: Option<WlOutput>,
     binding: Option<T>,
     becreated: bool,
+
+    map_state: WindowMapState,
 
     scale: u32,
     request_flag: WindowStateUnitRequestFlag,
@@ -567,6 +643,70 @@ impl<T> WindowStateUnit<T> {
             viewport: self.viewport.clone(),
             toplevel: self.shell.top_level(),
         }
+    }
+
+    pub fn request_map(&mut self) {
+        self.request_flag.visibility = Some(true);
+    }
+
+    pub fn request_unmap(&mut self) {
+        self.request_flag.visibility = Some(false);
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.map_state == WindowMapState::Mapped
+    }
+
+    fn can_commit_role_state(&self) -> bool {
+        self.map_state != WindowMapState::Unmapped
+    }
+
+    fn commit_role_state_if_visible(&self) {
+        if self.can_commit_role_state() {
+            self.wl_surface.commit();
+        }
+    }
+
+    fn handle_configure(&mut self) {
+        // Late configure events may arrive after a window was hidden. They must
+        // not remap the surface or schedule a frame by themselves.
+        if self.map_state == WindowMapState::Unmapped {
+            self.request_flag.refresh = RefreshRequest::Wait;
+            return;
+        }
+
+        self.map_state = WindowMapState::Mapped;
+        self.request_refresh(RefreshRequest::NextFrame);
+    }
+
+    fn map(&mut self) {
+        if self.map_state != WindowMapState::Unmapped {
+            return;
+        }
+
+        self.request_flag.refresh = RefreshRequest::Wait;
+        self.present_available_state = PresentAvailableState::Available;
+        self.map_state = WindowMapState::WaitingConfigure;
+
+        // The layer/xdg protocols require a bufferless commit before the
+        // compositor is allowed to configure the remapped surface.
+        self.shell.reapply_state();
+        self.wl_surface.commit();
+    }
+
+    fn unmap(&mut self) {
+        if self.map_state == WindowMapState::Unmapped {
+            return;
+        }
+
+        self.request_flag.refresh = RefreshRequest::Wait;
+        self.present_available_state = PresentAvailableState::Available;
+
+        // Attaching a null buffer unmaps the surface without destroying its
+        // role object or wl_surface. This is what separates hide from close.
+        self.wl_surface.attach(None, 0, 0);
+        self.wl_surface.commit();
+        self.map_state = WindowMapState::Unmapped;
     }
 }
 impl<T> WindowStateUnit<T> {
@@ -645,59 +785,98 @@ impl<T> WindowStateUnit<T> {
 
     /// set the anchor of the current unit. please take the simple.rs as reference
     pub fn set_anchor(&self, anchor: Anchor) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            state.borrow_mut().anchor = anchor;
             layer_shell.set_anchor(anchor);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
     /// you can reset the margin which bind to the surface
     pub fn set_margin(&self, (top, right, bottom, left): (i32, i32, i32, i32)) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            state.borrow_mut().margin = Some((top, right, bottom, left));
             layer_shell.set_margin(top, right, bottom, left);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
     /// set the layer
     pub fn set_layer(&self, layer: Layer) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            state.borrow_mut().layer = layer;
             layer_shell.set_layer(layer);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
     /// set the anchor and set the size together
     /// When you want to change layer from LEFT|RIGHT|BOTTOM to TOP|LEFT|BOTTOM, use it
     pub fn set_anchor_with_size(&self, anchor: Anchor, (width, height): (u32, u32)) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            let mut state = state.borrow_mut();
+            state.anchor = anchor;
+            state.size = Some((width, height));
+            drop(state);
+
             layer_shell.set_anchor(anchor);
             layer_shell.set_size(width, height);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
     /// set the layer size of current unit
     pub fn set_size(&self, (width, height): (u32, u32)) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            state.borrow_mut().size = Some((width, height));
             layer_shell.set_size(width, height);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
     /// set current exclusive_zone
     pub fn set_exclusive_zone(&self, zone: i32) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            state.borrow_mut().exclusive_zone = Some(zone);
             layer_shell.set_exclusive_zone(zone);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
     /// set keyboard interactivity
     pub fn set_keyboard_interactivity(&self, keyboard_interactivity: KeyboardInteractivity) {
-        if let Shell::LayerShell(layer_shell) = &self.shell {
+        if let Shell::LayerShell {
+            shell: layer_shell,
+            state,
+        } = &self.shell
+        {
+            state.borrow_mut().keyboard_interactivity = keyboard_interactivity;
             layer_shell.set_keyboard_interactivity(keyboard_interactivity);
-            self.wl_surface.commit();
+            self.commit_role_state_if_visible();
         }
     }
 
@@ -727,6 +906,10 @@ impl<T> WindowStateUnit<T> {
     /// this function will refresh whole surface. it will reattach the buffer, and damage whole,
     /// and final commit
     pub fn refresh(&self) {
+        if !self.is_mapped() {
+            return;
+        }
+
         self.wl_surface.attach(self.buffer.as_ref(), 0, 0);
         self.wl_surface
             .damage(0, 0, self.size.0 as i32, self.size.1 as i32);
@@ -746,6 +929,10 @@ impl<T> WindowStateUnit<T> {
     }
 
     pub fn request_refresh(&mut self, request: RefreshRequest) {
+        if !self.is_mapped() {
+            return;
+        }
+
         // refresh request in nearest future has the highest priority.
         match self.request_flag.refresh {
             RefreshRequest::NextFrame => {}
@@ -763,6 +950,10 @@ impl<T> WindowStateUnit<T> {
     }
 
     fn should_refresh(&self) -> bool {
+        if !self.is_mapped() {
+            return false;
+        }
+
         match self.request_flag.refresh {
             RefreshRequest::NextFrame => true,
             RefreshRequest::At(instant) => instant <= Instant::now(),
@@ -774,6 +965,10 @@ impl<T> WindowStateUnit<T> {
     /// or `None` if no refresh is pending or the present slot is
     /// unavailable (waiting for a compositor frame callback).
     fn refresh_timeout(&self) -> Option<Duration> {
+        if !self.is_mapped() {
+            return None;
+        }
+
         match self.request_flag.refresh {
             RefreshRequest::NextFrame => {
                 if self.present_available_state == PresentAvailableState::Available {
@@ -820,6 +1015,10 @@ impl<T> WindowStateUnit<T> {
 
 impl<T: 'static> WindowStateUnit<T> {
     pub fn request_next_present(&mut self) {
+        if !self.is_mapped() {
+            return;
+        }
+
         match self.present_available_state {
             PresentAvailableState::Taken => {
                 self.present_available_state = PresentAvailableState::Requested;
@@ -1005,6 +1204,59 @@ impl<T> WindowState<T> {
         }
         self.units.remove(index);
         Some(())
+    }
+
+    fn clear_surface_activity(&mut self, id: id::Id, surface: &WlSurface) {
+        if self
+            .current_surface
+            .as_ref()
+            .is_some_and(|current| current == surface)
+        {
+            self.current_surface = None;
+            self.message.push((Some(id), DispatchMessageInner::Unfocus));
+        }
+
+        let mut removed_fingers = Vec::new();
+        self.active_surfaces
+            .retain(|finger_id, (active_surface, _)| {
+                let keep = active_surface != surface;
+                if !keep && let Some(finger_id) = *finger_id {
+                    removed_fingers.push(finger_id);
+                }
+                keep
+            });
+        for finger_id in removed_fingers {
+            self.finger_locations.remove(&finger_id);
+        }
+
+        // A hidden surface cannot keep driving keyboard repeat timers.
+        let mut repeat_tokens = Vec::new();
+        for keyboard_state in self.get_keyboard_state_iter_mut() {
+            keyboard_state.current_repeat = None;
+            if let Some(token) = keyboard_state.repeat_token.take() {
+                repeat_tokens.push(token);
+            }
+        }
+        self.to_remove_tokens.extend(repeat_tokens);
+    }
+
+    fn apply_visibility_request(&mut self, id: id::Id, visible: bool) {
+        let Some(index) = self.units.iter().position(|unit| unit.id == id) else {
+            return;
+        };
+
+        if visible {
+            self.units[index].map();
+            return;
+        }
+
+        let surface = {
+            let unit = &mut self.units[index];
+            let surface = unit.wl_surface.clone();
+            unit.unmap();
+            surface
+        };
+        self.clear_surface_activity(id, &surface);
     }
 
     /// forget the remembered last output, next time it will get the new activated output to set the
@@ -1573,6 +1825,7 @@ impl<T> WindowState<T> {
     pub fn request_refresh_all(&mut self, request: RefreshRequest) {
         self.units
             .iter_mut()
+            .filter(|unit| unit.is_mapped())
             .for_each(|unit| unit.request_refresh(request));
     }
 
@@ -1590,6 +1843,16 @@ impl<T> WindowState<T> {
     pub fn get_binding_mut(&mut self, id: id::Id) -> Option<&mut T> {
         self.get_mut_unit_with_id(id)
             .and_then(WindowStateUnit::get_binding_mut)
+    }
+
+    pub fn request_map(&mut self, id: id::Id) {
+        self.get_mut_unit_with_id(id)
+            .map(WindowStateUnit::request_map);
+    }
+
+    pub fn request_unmap(&mut self, id: id::Id) {
+        self.get_mut_unit_with_id(id)
+            .map(WindowStateUnit::request_unmap);
     }
 }
 
@@ -1668,7 +1931,7 @@ impl<T> Dispatch<xdg_surface::XdgSurface, ()> for WindowState<T> {
                 .units
                 .iter_mut()
                 .filter(|unit| unit.shell == *surface)
-                .for_each(|unit| unit.request_refresh(RefreshRequest::NextFrame));
+                .for_each(WindowStateUnit::handle_configure);
         }
     }
 }
@@ -1696,7 +1959,7 @@ impl<T> Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WindowState<
                 };
                 state.units[unit_index].size = (width, height);
 
-                state.units[unit_index].request_refresh(RefreshRequest::NextFrame);
+                state.units[unit_index].handle_configure();
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 if let Some(i) = unit_index {
@@ -1727,7 +1990,7 @@ impl<T> Dispatch<xdg_toplevel::XdgToplevel, ()> for WindowState<T> {
                     state.units[unit_index].size = (width as u32, height as u32);
                 }
 
-                state.units[unit_index].request_refresh(RefreshRequest::NextFrame);
+                state.units[unit_index].handle_configure();
             }
             xdg_toplevel::Event::Close => {
                 let Some(unit_index) = unit_index else {
@@ -1756,7 +2019,7 @@ impl<T> Dispatch<xdg_popup::XdgPopup, ()> for WindowState<T> {
             };
             state.units[unit_index].size = (width as u32, height as u32);
 
-            state.units[unit_index].request_refresh(RefreshRequest::NextFrame)
+            state.units[unit_index].handle_configure()
         }
     }
 }
@@ -1879,7 +2142,7 @@ impl<T> Dispatch<WlSurface, ()> for WindowState<T> {
                 unit.wl_output.replace(output);
             }
             wl_surface::Event::Leave { output }
-                if !matches!(unit.shell, Shell::LayerShell(..))
+                if !matches!(unit.shell, Shell::LayerShell { .. })
                     && unit
                         .wl_output
                         .as_ref()
@@ -2202,19 +2465,15 @@ impl<T: 'static> WindowState<T> {
                 &qh,
                 (),
             );
-            layer.set_anchor(self.anchor);
-            layer.set_keyboard_interactivity(self.keyboard_interactivity);
-            if let Some((init_w, init_h)) = self.size {
-                layer.set_size(init_w, init_h);
-            }
-
-            if let Some(zone) = self.exclusive_zone {
-                layer.set_exclusive_zone(zone);
-            }
-
-            if let Some((top, right, bottom, left)) = self.margin {
-                layer.set_margin(top, right, bottom, left);
-            }
+            let layer_state = LayerSurfaceState::new(
+                self.layer,
+                self.anchor,
+                self.keyboard_interactivity,
+                self.size,
+                self.exclusive_zone,
+                self.margin,
+            );
+            layer_state.apply_to(&layer);
 
             if self.events_transparent {
                 let region = wmcompositer.create_region(&qh, ());
@@ -2242,7 +2501,10 @@ impl<T: 'static> WindowState<T> {
                     qh.clone(),
                     connection.display(),
                     wl_surface,
-                    Shell::LayerShell(layer),
+                    Shell::LayerShell {
+                        shell: layer,
+                        state: RefCell::new(layer_state),
+                    },
                 )
                 .viewport(viewport)
                 .zxdgoutput(binded_xdginfo)
@@ -2265,19 +2527,15 @@ impl<T: 'static> WindowState<T> {
                     &qh,
                     (),
                 );
-                layer.set_anchor(self.anchor);
-                layer.set_keyboard_interactivity(self.keyboard_interactivity);
-                if let Some((init_w, init_h)) = self.size {
-                    layer.set_size(init_w, init_h);
-                }
-
-                if let Some(zone) = self.exclusive_zone {
-                    layer.set_exclusive_zone(zone);
-                }
-
-                if let Some((top, right, bottom, left)) = self.margin {
-                    layer.set_margin(top, right, bottom, left);
-                }
+                let layer_state = LayerSurfaceState::new(
+                    self.layer,
+                    self.anchor,
+                    self.keyboard_interactivity,
+                    self.size,
+                    self.exclusive_zone,
+                    self.margin,
+                );
+                layer_state.apply_to(&layer);
 
                 if self.events_transparent {
                     let region = wmcompositer.create_region(&qh, ());
@@ -2306,7 +2564,10 @@ impl<T: 'static> WindowState<T> {
                         qh.clone(),
                         connection.display(),
                         wl_surface,
-                        Shell::LayerShell(layer),
+                        Shell::LayerShell {
+                            shell: layer,
+                            state: RefCell::new(layer_state),
+                        },
                     )
                     .viewport(viewport)
                     .zxdgoutput(Some(ZxdgOutputInfo::new(zxdgoutput)))
@@ -2470,19 +2731,15 @@ impl<T: 'static> WindowState<T> {
                             &qh,
                             (),
                         );
-                        layer.set_anchor(window_state.anchor);
-                        layer.set_keyboard_interactivity(window_state.keyboard_interactivity);
-                        if let Some((init_w, init_h)) = window_state.size {
-                            layer.set_size(init_w, init_h);
-                        }
-
-                        if let Some(zone) = window_state.exclusive_zone {
-                            layer.set_exclusive_zone(zone);
-                        }
-
-                        if let Some((top, right, bottom, left)) = window_state.margin {
-                            layer.set_margin(top, right, bottom, left);
-                        }
+                        let layer_state = LayerSurfaceState::new(
+                            window_state.layer,
+                            window_state.anchor,
+                            window_state.keyboard_interactivity,
+                            window_state.size,
+                            window_state.exclusive_zone,
+                            window_state.margin,
+                        );
+                        layer_state.apply_to(&layer);
 
                         if window_state.events_transparent {
                             let region = wmcompositer.create_region(&qh, ());
@@ -2509,7 +2766,10 @@ impl<T: 'static> WindowState<T> {
                                 qh.clone(),
                                 connection.display(),
                                 wl_surface,
-                                Shell::LayerShell(layer),
+                                Shell::LayerShell {
+                                    shell: layer,
+                                    state: RefCell::new(layer_state),
+                                },
                             )
                             .viewport(viewport)
                             .zxdgoutput(Some(ZxdgOutputInfo::new(zxdgoutput)))
@@ -2601,27 +2861,24 @@ impl<T: 'static> WindowState<T> {
                             let layer_shell = globals
                                 .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
                                 .unwrap();
+                            let target_layer = layer;
                             let layer = layer_shell.get_layer_surface(
                                 &wl_surface,
                                 output.as_ref(),
-                                layer,
+                                target_layer,
                                 namespace.unwrap_or_else(|| window_state.namespace.clone()),
                                 &qh,
                                 (),
                             );
-                            layer.set_anchor(anchor);
-                            layer.set_keyboard_interactivity(keyboard_interactivity);
-                            if let Some((init_w, init_h)) = size {
-                                layer.set_size(init_w, init_h);
-                            }
-
-                            if let Some(zone) = exclusive_zone {
-                                layer.set_exclusive_zone(zone);
-                            }
-
-                            if let Some((top, right, bottom, left)) = margin {
-                                layer.set_margin(top, right, bottom, left);
-                            }
+                            let layer_state = LayerSurfaceState::new(
+                                target_layer,
+                                anchor,
+                                keyboard_interactivity,
+                                size,
+                                exclusive_zone,
+                                margin,
+                            );
+                            layer_state.apply_to(&layer);
 
                             if events_transparent {
                                 let region = wmcompositer.create_region(&qh, ());
@@ -2650,7 +2907,10 @@ impl<T: 'static> WindowState<T> {
                                     qh.clone(),
                                     connection.display(),
                                     wl_surface,
-                                    Shell::LayerShell(layer),
+                                    Shell::LayerShell {
+                                        shell: layer,
+                                        state: RefCell::new(layer_state),
+                                    },
                                 )
                                 .viewport(viewport)
                                 .fractional_scale(fractional_scale)
@@ -2683,7 +2943,8 @@ impl<T: 'static> WindowState<T> {
                             let wl_xdg_surface = wmbase.get_xdg_surface(&wl_surface, &qh, ());
                             let popup = wl_xdg_surface.get_popup(None, &positioner, &qh, ());
 
-                            let Shell::LayerShell(shell) = &window_state.units[index].shell else {
+                            let Shell::LayerShell { shell, .. } = &window_state.units[index].shell
+                            else {
                                 unreachable!()
                             };
                             shell.get_popup(&popup);
@@ -2889,6 +3150,20 @@ impl<T: 'static> WindowState<T> {
                     Some(id),
                 );
                 window_state.remove_shell(id);
+            }
+
+            let visibility_requests: Vec<_> = window_state
+                .units
+                .iter_mut()
+                .filter_map(|unit| {
+                    unit.request_flag
+                        .visibility
+                        .take()
+                        .map(|visible| (unit.id(), visible))
+                })
+                .collect();
+            for (id, visible) in visibility_requests {
+                window_state.apply_visibility_request(id, visible);
             }
 
             let closed_ids = window_state.closed_ids.clone();

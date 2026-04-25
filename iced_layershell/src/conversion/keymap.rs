@@ -559,7 +559,7 @@ pub fn key_code(key_code: layershellev::keyboard::KeyCode) -> Option<keyboard::k
         KeyCode::F33 => keyboard::key::Code::F33,
         KeyCode::F34 => keyboard::key::Code::F34,
         KeyCode::F35 => keyboard::key::Code::F35,
-        _ => None?,
+        _ => return None,
     })
 }
 

@@ -416,6 +416,15 @@ where
         };
         let (width, height) = layer_shell_window.get_size();
         let scale_float = layer_shell_window.scale_float();
+
+        if self
+            .window_manager
+            .get_alias(layer_shell_window.id())
+            .is_some_and(|(_, window)| !window.visible)
+        {
+            return;
+        }
+
         // events may not be handled after RequestRefreshWithWrapper in the same
         // interaction, we dispatched them immediately.
         let mut events = Vec::new();
@@ -802,6 +811,55 @@ where
                     ev.request_close(layer_shell_id)
                 }
             }
+            LayerShellCustomAction::UnmapWindow => {
+                if iced_id.is_none() {
+                    if let Some(window) = self.window_manager.first() {
+                        iced_id = Some(window.iced_id);
+                        layer_shell_id = Some(window.id);
+                    } else {
+                        return;
+                    }
+                }
+
+                let Some(iced_id) = iced_id else {
+                    return;
+                };
+                let Some(layer_shell_id) = layer_shell_id else {
+                    return;
+                };
+
+                // Hide is intentionally not close: keep renderer, UI cache and
+                // compositor-owned surface so show can reuse Device/Queue.
+                self.window_manager.set_visible(iced_id, false);
+                self.cached_layer_dimensions.remove(&iced_id);
+                ev.request_unmap(layer_shell_id);
+            }
+            LayerShellCustomAction::MapWindow => {
+                if iced_id.is_none() {
+                    if let Some(window) = self.window_manager.first() {
+                        iced_id = Some(window.iced_id);
+                        layer_shell_id = Some(window.id);
+                    } else {
+                        return;
+                    }
+                }
+
+                let Some(iced_id) = iced_id else {
+                    return;
+                };
+                let Some(layer_shell_id) = layer_shell_id else {
+                    return;
+                };
+
+                if let Some(window) = self.window_manager.get_mut(iced_id) {
+                    // Re-send any role state that Wayland discards on unmap
+                    // before layershellev performs the bufferless remap commit.
+                    window.visible = true;
+                    window.state.reapply_role_state();
+                }
+                self.cached_layer_dimensions.remove(&iced_id);
+                ev.request_map(layer_shell_id);
+            }
             LayerShellCustomAction::NewPopUp {
                 settings: menusettings,
                 id: iced_id,
@@ -890,6 +948,10 @@ where
             });
 
             if window_events.is_empty() && self.messages.is_empty() {
+                continue;
+            }
+
+            if !window.visible {
                 continue;
             }
 

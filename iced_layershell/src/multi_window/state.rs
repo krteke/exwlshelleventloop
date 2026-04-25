@@ -42,6 +42,14 @@ where
         }
     }
 
+    pub fn reapply_role_state(&self) {
+        if let Some(toplevel) = &self.toplevel {
+            // xdg_toplevel discards role state when it is unmapped. Re-send the
+            // last synchronized title before the bufferless remap commit.
+            toplevel.set_title(self.title.clone());
+        }
+    }
+
     pub fn new(
         id: window::Id,
         application: &Instance<P>,

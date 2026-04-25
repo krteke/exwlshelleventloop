@@ -8,6 +8,8 @@ fn test_layer_message_macro() {
         TestA,
     }
     let e = TestEnum::SizeChange((10, 10));
+    let _ = TestEnum::UnmapWindow;
+    let _ = TestEnum::MapWindow;
     let _ = e.clone();
 }
 
@@ -20,4 +22,7 @@ fn test_layer_message_macro_multi() {
     }
     use layershellev::*;
     let (_id, _message) = TestEnum::layershell_open(NewLayerShellSettings::default());
+    let id = iced_layershell::reexport::IcedId::unique();
+    let _ = TestEnum::UnmapWindow(id);
+    let _ = TestEnum::MapWindow(id);
 }

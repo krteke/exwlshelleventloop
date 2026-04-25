@@ -26,6 +26,9 @@ where
     pub renderer: P::Renderer,
     pub surface: C::Surface,
     pub state: State<P>,
+    /// Application-requested visibility. Hidden windows keep all rendering
+    /// resources alive, but are skipped by redraw scheduling.
+    pub visible: bool,
     pub mouse_interaction: mouse::Interaction,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(iced_core::Rectangle, input_method::Purpose)>,
@@ -110,6 +113,7 @@ where
                 renderer,
                 surface,
                 state,
+                visible: true,
                 mouse_interaction: mouse::Interaction::Idle,
                 preedit: None,
                 ime_state: None,
@@ -122,6 +126,12 @@ where
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn set_visible(&mut self, id: IcedId, visible: bool) {
+        if let Some(window) = self.entries.get_mut(&id) {
+            window.visible = visible;
+        }
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (IcedId, &mut Window<P, C>)> {

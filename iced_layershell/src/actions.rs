@@ -58,6 +58,7 @@ impl ActionCallback {
 }
 
 /// NOTE: DO NOT USE THIS ENUM DIERCTLY
+///
 /// use macro to_layer_message
 #[derive(Debug, Clone)]
 pub enum LayerShellCustomAction {
@@ -95,10 +96,15 @@ pub enum LayerShellCustomAction {
     },
     /// is same with WindowAction::Close(id)
     RemoveWindow,
+    /// Hide the window by unmapping its Wayland surface without destroying it.
+    UnmapWindow,
+    /// Show a previously unmapped window without recreating the compositor.
+    MapWindow,
     ForgetLastOutput,
 }
 
 /// Please do not use this struct directly
+///
 /// Use macro to_layer_message instead
 #[derive(Debug, Clone)]
 pub struct LayerShellCustomActionWithId(pub Option<IcedId>, pub LayerShellCustomAction);
