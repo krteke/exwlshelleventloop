@@ -70,6 +70,14 @@ where
     }
 
     pub fn remove(&mut self, id: IcedId) {
+        if let Some(window) = self.entries.get(&id) {
+            tracing::info!(
+                "[iced_layershell][surface_dropped] iced_id={:?} layer_id={:?} visible={}",
+                id,
+                window.id,
+                window.visible
+            );
+        }
         let remove_alias = self
             .aliases
             .iter()
@@ -100,7 +108,21 @@ where
         let layerid = window.id();
         let state = State::new(id, application, size, fractal_scale, &window, system_theme);
         let physical_size = state.viewport().physical_size();
+        tracing::info!(
+            "[iced_layershell][create_surface] iced_id={:?} layer_id={:?} size={}x{}",
+            id,
+            layerid,
+            physical_size.width,
+            physical_size.height
+        );
         let surface = compositor.create_surface(window, physical_size.width, physical_size.height);
+        tracing::info!(
+            "[iced_layershell][surface_configured] iced_id={:?} layer_id={:?} size={}x{} source=initial_create",
+            id,
+            layerid,
+            physical_size.width,
+            physical_size.height
+        );
         let renderer = compositor.create_renderer();
         let _ = self.aliases.insert(layerid, id);
         let _ = self.back_aliases.insert(id, layerid);
@@ -130,6 +152,12 @@ where
 
     pub fn set_visible(&mut self, id: IcedId, visible: bool) {
         if let Some(window) = self.entries.get_mut(&id) {
+            tracing::info!(
+                "[iced_layershell][visibility_change] iced_id={:?} layer_id={:?} visible={}",
+                id,
+                window.id,
+                visible
+            );
             window.visible = visible;
         }
     }

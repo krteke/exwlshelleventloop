@@ -327,10 +327,22 @@ where
         window: Arc<WindowWrapper>,
         display: DisplayWrapper,
     ) -> Self {
+        tracing::info!(
+            "[iced_layershell][create_compositor] layer_id={:?}",
+            window.id()
+        );
         let shell = Shell::new(self.proxy.clone());
         let mut new_compositor = C::new(self.compositor_settings, display, window.clone(), shell)
             .await
             .expect("Cannot create compositer");
+        tracing::info!(
+            "[iced_layershell][device_created] layer_id={:?} source=compositor_new",
+            window.id()
+        );
+        tracing::info!(
+            "[iced_layershell][queue_created] layer_id={:?} source=compositor_new",
+            window.id()
+        );
         for font in self.fonts.clone() {
             new_compositor.load_font(font);
         }
@@ -340,6 +352,7 @@ where
     }
 
     fn remove_compositor(&mut self) {
+        tracing::info!("[iced_layershell][remove_compositor]");
         self.compositor = None;
         self.clipboard = LayerShellClipboard::unconnected();
     }
@@ -540,6 +553,14 @@ where
                 (physical_size, window.state.viewport().scale_factor()),
             );
 
+            tracing::info!(
+                "[iced_layershell][surface_configured] iced_id={:?} layer_id={:?} size={}x{} scale={}",
+                iced_id,
+                window.id,
+                physical_size.width,
+                physical_size.height,
+                window.state.viewport().scale_factor()
+            );
             compositor.configure_surface(
                 &mut window.surface,
                 physical_size.width,
@@ -584,6 +605,11 @@ where
             window.state.viewport(),
             window.state.background_color(),
             || {
+                tracing::info!(
+                    "[iced_layershell][frame_callback] iced_id={:?} layer_id={:?} phase=request",
+                    iced_id,
+                    layer_shell_id
+                );
                 ev.request_next_present(layer_shell_id);
             },
         ) {
@@ -832,6 +858,11 @@ where
                 // compositor-owned surface so show can reuse Device/Queue.
                 self.window_manager.set_visible(iced_id, false);
                 self.cached_layer_dimensions.remove(&iced_id);
+                tracing::info!(
+                    "[iced_layershell][unmap] iced_id={:?} layer_id={:?}",
+                    iced_id,
+                    layer_shell_id
+                );
                 ev.request_unmap(layer_shell_id);
             }
             LayerShellCustomAction::MapWindow => {
@@ -858,6 +889,11 @@ where
                     window.state.reapply_role_state();
                 }
                 self.cached_layer_dimensions.remove(&iced_id);
+                tracing::info!(
+                    "[iced_layershell][map] iced_id={:?} layer_id={:?}",
+                    iced_id,
+                    layer_shell_id
+                );
                 ev.request_map(layer_shell_id);
             }
             LayerShellCustomAction::NewPopUp {

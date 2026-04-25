@@ -55,6 +55,7 @@ where
     T: Send,
 {
     fn request_redraw(&self) {
+        tracing::info!("[iced_layershell][request_redraw] target=all_windows");
         self.send_action(Action::Window(window::Action::RedrawAll));
     }
 

@@ -668,6 +668,11 @@ impl<T> WindowStateUnit<T> {
     }
 
     fn handle_configure(&mut self) {
+        log::info!(
+            "[layershellev][configure_received] window_id={:?} map_state={:?}",
+            self.id,
+            self.map_state
+        );
         // Late configure events may arrive after a window was hidden. They must
         // not remap the surface or schedule a frame by themselves.
         if self.map_state == WindowMapState::Unmapped {
@@ -684,6 +689,7 @@ impl<T> WindowStateUnit<T> {
             return;
         }
 
+        log::info!("[layershellev][map] window_id={:?}", self.id);
         self.request_flag.refresh = RefreshRequest::Wait;
         self.present_available_state = PresentAvailableState::Available;
         self.map_state = WindowMapState::WaitingConfigure;
@@ -691,6 +697,10 @@ impl<T> WindowStateUnit<T> {
         // The layer/xdg protocols require a bufferless commit before the
         // compositor is allowed to configure the remapped surface.
         self.shell.reapply_state();
+        log::info!(
+            "[layershellev][attach_null_buffer] window_id={:?} reason=bufferless_remap_commit",
+            self.id
+        );
         self.wl_surface.commit();
     }
 
@@ -699,11 +709,16 @@ impl<T> WindowStateUnit<T> {
             return;
         }
 
+        log::info!("[layershellev][unmap] window_id={:?}", self.id);
         self.request_flag.refresh = RefreshRequest::Wait;
         self.present_available_state = PresentAvailableState::Available;
 
         // Attaching a null buffer unmaps the surface without destroying its
         // role object or wl_surface. This is what separates hide from close.
+        log::info!(
+            "[layershellev][attach_null_buffer] window_id={:?} reason=hide_unmap",
+            self.id
+        );
         self.wl_surface.attach(None, 0, 0);
         self.wl_surface.commit();
         self.map_state = WindowMapState::Unmapped;
@@ -910,6 +925,12 @@ impl<T> WindowStateUnit<T> {
             return;
         }
 
+        log::info!(
+            "[layershellev][attach_buffer] window_id={:?} size={}x{}",
+            self.id,
+            self.size.0,
+            self.size.1
+        );
         self.wl_surface.attach(self.buffer.as_ref(), 0, 0);
         self.wl_surface
             .damage(0, 0, self.size.0 as i32, self.size.1 as i32);
@@ -933,6 +954,11 @@ impl<T> WindowStateUnit<T> {
             return;
         }
 
+        log::info!(
+            "[layershellev][request_redraw] window_id={:?} request={:?}",
+            self.id,
+            request
+        );
         // refresh request in nearest future has the highest priority.
         match self.request_flag.refresh {
             RefreshRequest::NextFrame => {}
@@ -1022,6 +1048,10 @@ impl<T: 'static> WindowStateUnit<T> {
         match self.present_available_state {
             PresentAvailableState::Taken => {
                 self.present_available_state = PresentAvailableState::Requested;
+                log::info!(
+                    "[layershellev][frame_callback] window_id={:?} phase=request",
+                    self.id
+                );
                 self.wl_surface
                     .frame(&self.qh, (self.id, PresentAvailableState::Available));
             }
@@ -1196,7 +1226,9 @@ impl<T> WindowState<T> {
             .iter()
             .position(|unit| unit.id == id && unit.becreated)?;
 
+        log::info!("[layershellev][destroy_surface] window_id={id:?} kind=role_object");
         self.units[index].shell.destroy();
+        log::info!("[layershellev][destroy_surface] window_id={id:?} kind=wl_surface");
         self.units[index].wl_surface.destroy();
 
         if let Some(buffer) = self.units[index].buffer.as_ref() {
@@ -1926,6 +1958,8 @@ impl<T> Dispatch<xdg_surface::XdgSurface, ()> for WindowState<T> {
         _qh: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
+            log::info!("[layershellev][configure_received] serial={serial} kind=xdg_surface");
+            log::info!("[layershellev][ack_configure] serial={serial} kind=xdg_surface");
             surface.ack_configure(serial);
             state
                 .units
@@ -1952,6 +1986,16 @@ impl<T> Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WindowState<
                 width,
                 height,
             } => {
+                log::info!(
+                    "[layershellev][configure_received] serial={serial} kind=layer_surface size={}x{}",
+                    width,
+                    height
+                );
+                log::info!(
+                    "[layershellev][ack_configure] serial={serial} kind=layer_surface size={}x{}",
+                    width,
+                    height
+                );
                 surface.ack_configure(serial);
 
                 let Some(unit_index) = unit_index else {
@@ -1983,6 +2027,11 @@ impl<T> Dispatch<xdg_toplevel::XdgToplevel, ()> for WindowState<T> {
         let unit_index = state.units.iter().position(|unit| unit.shell == *surface);
         match event {
             xdg_toplevel::Event::Configure { width, height, .. } => {
+                log::info!(
+                    "[layershellev][configure_received] kind=xdg_toplevel size={}x{}",
+                    width,
+                    height
+                );
                 let Some(unit_index) = unit_index else {
                     return;
                 };
@@ -2013,6 +2062,11 @@ impl<T> Dispatch<xdg_popup::XdgPopup, ()> for WindowState<T> {
         _qhandle: &QueueHandle<Self>,
     ) {
         if let xdg_popup::Event::Configure { width, height, .. } = event {
+            log::info!(
+                "[layershellev][configure_received] kind=xdg_popup size={}x{}",
+                width,
+                height
+            );
             let Some(unit_index) = state.units.iter().position(|unit| unit.shell == *surface)
             else {
                 return;
@@ -2299,6 +2353,11 @@ impl<T> Dispatch<WlCallback, (id::Id, PresentAvailableState)> for WindowState<T>
         if let WlCallbackEvent::Done { callback_data: _ } = event
             && let Some(unit) = state.get_mut_unit_with_id(data.0)
         {
+            log::info!(
+                "[layershellev][frame_callback] window_id={:?} phase=done next_state={:?}",
+                data.0,
+                data.1
+            );
             unit.present_available_state = data.1;
         }
     }
@@ -2454,6 +2513,7 @@ impl<T: 'static> WindowState<T> {
             };
 
             let wl_surface = wmcompositer.create_surface(&qh, ()); // and create a surface. if two or more,
+            log::info!("[layershellev][create_surface] kind=layer_surface phase=initial_startup");
             let layer_shell = globals
                 .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
                 .unwrap();
@@ -2516,6 +2576,9 @@ impl<T: 'static> WindowState<T> {
             let displays = self.outputs.clone();
             for output_display in displays.iter() {
                 let wl_surface = wmcompositer.create_surface(&qh, ()); // and create a surface. if two or more,
+                log::info!(
+                    "[layershellev][create_surface] kind=layer_surface phase=initial_allscreens"
+                );
                 let layer_shell = globals
                     .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
                     .unwrap();
@@ -2720,6 +2783,9 @@ impl<T: 'static> WindowState<T> {
                             continue;
                         }
                         let wl_surface = wmcompositer.create_surface(&qh, ());
+                        log::info!(
+                            "[layershellev][create_surface] kind=layer_surface phase=new_display"
+                        );
                         let layer_shell = globals
                             .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
                             .unwrap();
@@ -2858,6 +2924,9 @@ impl<T: 'static> WindowState<T> {
                             };
 
                             let wl_surface = wmcompositer.create_surface(&qh, ());
+                            log::info!(
+                                "[layershellev][create_surface] kind=layer_surface phase=runtime_new_layer_shell window_id={id:?}"
+                            );
                             let layer_shell = globals
                                 .bind::<ZwlrLayerShellV1, _, _>(&qh, 3..=4, ())
                                 .unwrap();
@@ -2937,6 +3006,9 @@ impl<T: 'static> WindowState<T> {
                                 continue;
                             };
                             let wl_surface = wmcompositer.create_surface(&qh, ());
+                            log::info!(
+                                "[layershellev][create_surface] kind=popup phase=runtime_new_popup window_id={targetid:?}"
+                            );
                             let positioner = wmbase.create_positioner(&qh, ());
                             positioner.set_size(width as i32, height as i32);
                             positioner.set_anchor_rect(x, y, width as i32, height as i32);
@@ -2985,6 +3057,9 @@ impl<T: 'static> WindowState<T> {
                             info,
                         )) => {
                             let wl_surface = wmcompositer.create_surface(&qh, ());
+                            log::info!(
+                                "[layershellev][create_surface] kind=xdg_toplevel phase=runtime_new_xdg window_id={id:?}"
+                            );
                             let wl_xdg_surface = wmbase.get_xdg_surface(&wl_surface, &qh, ());
                             let toplevel = wl_xdg_surface.get_toplevel(&qh, ());
 
@@ -3081,6 +3156,9 @@ impl<T: 'static> WindowState<T> {
                             };
 
                             let wl_surface = wmcompositer.create_surface(&qh, ());
+                            log::info!(
+                                "[layershellev][create_surface] kind=input_panel phase=runtime_new_input_panel window_id={id:?}"
+                            );
                             let input_panel = globals
                                 .bind::<ZwpInputPanelV1, _, _>(&qh, 1..=1, ())
                                 .unwrap();
@@ -3208,6 +3286,12 @@ impl<T: 'static> WindowState<T> {
                         ) else {
                             panic!("You cannot return this one");
                         };
+                        log::info!(
+                            "[layershellev][attach_buffer] window_id={:?} size={}x{} source=initial_buffer",
+                            unit_id,
+                            width,
+                            height
+                        );
                         wl_surface.attach(Some(&buffer), 0, 0);
                         wl_surface.commit();
                         window_state.units[idx].buffer = Some(buffer);
