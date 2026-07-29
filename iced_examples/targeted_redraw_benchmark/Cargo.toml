@@ -1,0 +1,15 @@
+[package]
+name = "targeted_redraw_benchmark"
+authors.workspace = true
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+keywords.workspace = true
+readme = "README.md"
+publish = false
+
+[dependencies]
+iced = { workspace = true, features = ["canvas", "tokio"] }
+iced_layershell.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "iced-layershell-redraw-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+debug = []
+
+[dependencies]
+criterion = { version = "=0.8.2", default-features = false }
+iced_core = "=0.14.0"
+
+[[bench]]
+name = "redraw_policy"
+harness = false
