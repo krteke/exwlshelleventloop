@@ -1,3 +1,4 @@
+use crate::redraw::{Policy, Targets};
 use crate::reexport::{PopupAnchor, PopupConstraintAdjustment};
 use crate::{
     DefaultStyle,
@@ -83,6 +84,7 @@ pub fn run<P>(
     namespace: &str,
     settings: Settings,
     compositor_settings: iced_graphics::Settings,
+    redraw_policy: Policy<P::Message>,
 ) -> Result<(), Error>
 where
     P: IcedProgram + 'static,
@@ -180,6 +182,7 @@ where
         settings.fonts,
         system_theme,
         proxy_back,
+        redraw_policy,
     );
     let mut context_state = ContextState::Context(context);
     boot_span.finish();
@@ -314,6 +317,7 @@ where
     iced_events: Vec<(IcedId, IcedEvent)>,
     messages: Vec<P::Message>,
     proxy: IcedProxy<Action<P::Message>>,
+    redraw_policy: Policy<P::Message>,
     time: Instant,
 }
 
@@ -332,6 +336,7 @@ where
         fonts: Vec<Cow<'static, [u8]>>,
         system_theme: iced_core::theme::Mode,
         proxy: IcedProxy<Action<P::Message>>,
+        redraw_policy: Policy<P::Message>,
     ) -> Self {
         Self {
             compositor_settings,
@@ -348,6 +353,7 @@ where
             iced_events: Default::default(),
             messages: Default::default(),
             proxy,
+            redraw_policy,
             time: Instant::now(),
         }
     }
@@ -1031,7 +1037,24 @@ where
         }
 
         if !self.messages.is_empty() {
-            ev.request_refresh_all(RefreshRequest::NextFrame);
+            match self.redraw_policy.targets(&self.messages) {
+                Targets::All => {
+                    ev.request_refresh_all(RefreshRequest::NextFrame);
+                }
+                Targets::None => {}
+                Targets::Window(id) => {
+                    if let Some(w) = self.window_manager.get(id) {
+                        ev.request_refresh(w.id, RefreshRequest::NextFrame);
+                    }
+                }
+                Targets::Windows(windows) => {
+                    windows.into_iter().for_each(|id| {
+                        if let Some(w) = self.window_manager.get(id) {
+                            ev.request_refresh(w.id, RefreshRequest::NextFrame);
+                        }
+                    });
+                }
+            }
             let (caches, application) = self.user_interfaces.extract_all();
 
             // Update application

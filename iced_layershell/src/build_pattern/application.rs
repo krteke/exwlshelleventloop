@@ -9,6 +9,7 @@ use iced_runtime::Task;
 use crate::actions::LayerShellCustomActionWithId;
 
 use crate::DefaultStyle;
+use crate::redraw::Policy;
 use crate::settings::LayerShellSettings;
 
 use crate::Result;
@@ -616,7 +617,13 @@ impl<P: Program> SingleApplication<P> {
             settings.layer_settings.start_mode,
             StartMode::AllScreens | StartMode::Background
         ));
-        crate::multi_window::run(program, &self.namespace, settings, renderer_settings)
+        crate::multi_window::run(
+            program,
+            &self.namespace,
+            settings,
+            renderer_settings,
+            Policy::default(),
+        )
     }
 
     pub fn settings(self, settings: Settings) -> Self {

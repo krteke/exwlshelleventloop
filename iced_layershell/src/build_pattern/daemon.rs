@@ -7,6 +7,8 @@ use iced_runtime::Task;
 use crate::actions::LayerShellCustomActionWithId;
 
 use crate::DefaultStyle;
+use crate::redraw::Policy;
+use crate::redraw::Scope;
 use crate::settings::LayerShellSettings;
 
 use crate::Result;
@@ -149,6 +151,7 @@ pub struct Daemon<A: Program> {
     raw: A,
     settings: Settings,
     namespace: String,
+    redraw_policy: Policy<A::Message>,
 }
 
 pub fn daemon<State, Message, Theme, Renderer>(
@@ -235,6 +238,7 @@ where
         },
         settings: Settings::default(),
         namespace: namespace.namespace(),
+        redraw_policy: Policy::default(),
     }
 }
 
@@ -663,19 +667,28 @@ impl<P: Program> Daemon<P> {
             + TryInto<LayerShellCustomActionWithId, Error = P::Message>,
     {
         let settings = self.settings;
+        let redraw_policy = self.redraw_policy;
         #[cfg(all(feature = "debug", not(target_arch = "wasm32")))]
-        let program = {
+        let (program, redraw_policy) = {
             iced_debug::init(iced_debug::Metadata {
                 name: P::name(),
                 theme: None,
                 can_time_travel: cfg!(feature = "time-travel"),
             });
 
-            super::attach(self.raw)
+            (
+                super::attach(self.raw),
+                redraw_policy.for_wrapped_messages(
+                    |event: &iced_exdevtools::Event<P>| match event {
+                        iced_exdevtools::Event::Program(message) => Some(message),
+                        _ => None,
+                    },
+                ),
+            )
         };
 
         #[cfg(any(not(feature = "debug"), target_arch = "wasm32"))]
-        let program = self.raw;
+        let (program, redraw_policy) = (self.raw, redraw_policy);
         let renderer_settings = iced_graphics::Settings {
             default_font: settings.default_font,
             default_text_size: settings.default_text_size,
@@ -686,7 +699,13 @@ impl<P: Program> Daemon<P> {
             },
             ..Default::default()
         };
-        crate::multi_window::run(program, &self.namespace, settings, renderer_settings)
+        crate::multi_window::run(
+            program,
+            &self.namespace,
+            settings,
+            renderer_settings,
+            redraw_policy,
+        )
     }
 
     pub fn settings(self, settings: Settings) -> Self {
@@ -755,6 +774,7 @@ impl<P: Program> Daemon<P> {
             raw: with_style(self.raw, move |state, theme| f(state, theme)),
             settings: self.settings,
             namespace: self.namespace,
+            redraw_policy: self.redraw_policy,
         }
     }
     /// Sets the subscription logic of the [`Daemon`].
@@ -766,10 +786,11 @@ impl<P: Program> Daemon<P> {
             raw: with_subscription(self.raw, move |state| f(state)),
             settings: self.settings,
             namespace: self.namespace,
+            redraw_policy: self.redraw_policy,
         }
     }
 
-    /// Sets the subscription logic of the [`Daemon`].
+    /// Sets the title logic of the [`Daemon`].
     pub fn title(
         self,
         f: impl Fn(&P::State, iced_core::window::Id) -> Option<String>,
@@ -778,6 +799,7 @@ impl<P: Program> Daemon<P> {
             raw: with_title(self.raw, move |state, id| f(state, id)),
             settings: self.settings,
             namespace: self.namespace,
+            redraw_policy: self.redraw_policy,
         }
     }
 
@@ -790,6 +812,7 @@ impl<P: Program> Daemon<P> {
             raw: with_theme(self.raw, move |state, id| f.theme(state, id)),
             settings: self.settings,
             namespace: self.namespace,
+            redraw_policy: self.redraw_policy,
         }
     }
 
@@ -802,6 +825,7 @@ impl<P: Program> Daemon<P> {
             raw: with_scale_factor(self.raw, move |state, id| f(state, id)),
             settings: self.settings,
             namespace: self.namespace,
+            redraw_policy: self.redraw_policy,
         }
     }
     /// Sets the executor of the [`Daemon`].
@@ -815,6 +839,15 @@ impl<P: Program> Daemon<P> {
             raw: with_executor::<P, E>(self.raw),
             settings: self.settings,
             namespace: self.namespace,
+            redraw_policy: self.redraw_policy,
         }
+    }
+
+    /// Sets the redraw scope of the [`Daemon`].
+    ///
+    /// Messages redraw all surfaces unless this method is called.
+    pub fn redraw_scope(mut self, scope: impl Fn(&P::Message) -> Scope + 'static) -> Self {
+        self.redraw_policy = Policy::new(scope);
+        self
     }
 }
